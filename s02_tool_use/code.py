@@ -108,11 +108,10 @@ TOOLS = [
 ]
 
 TOOL_HANDLERS = {
-    "bash": run_bash,
-    "read_file": run_read,
-    "write_file": run_write,
-    "edit_file": run_edit,
-    "glob": run_glob,
+    "bash":       lambda **kw: run_bash(kw["command"]),
+    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
 
 
@@ -135,7 +134,7 @@ def agent_loop(messages: list):
         results = []
         for block in response.content:
             if block.type == "tool_use":
-                print(f"\033[33m$ {block.input['command']}\033[0m")
+                print(f"\033[33m$ {block.name}\033[0m")
                 handler = TOOL_HANDLERS.get(block.name)
                 output = handler(**block.input) if handler else f"Unknown: {block.name}"
                 print(output[:200])
@@ -149,7 +148,7 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
-    print("s01: Agent Loop")
+    print("s02: Tool use")
     print("输入问题，回车发送。输入 q 退出。\n")
 
     history = []

@@ -3,6 +3,8 @@ import subprocess
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Any
 
 
 # ── Settings ────────────────────────────
@@ -113,6 +115,27 @@ TOOL_HANDLERS = {
 }
 
 
+# ── Unified Context Object ─────────────────────────
+
+
+@dataclass
+class HookContent:
+    """统一传给所有 hook 的上下文对象, 用于统一不同钩子函数之间传入参数"""
+    hook_event_name: str                        # 事件名
+    tool_name: str | None = None                # 工具名
+    tool_input: dict[str, Any] | None = None    # 工具输入
+    tool_output: str | None = None              # 工具输出
+    user_query: str | None = None               # 用户输入
+    message: list | None = None                 # 消息历史
+
+
+@dataclass
+class HookResult:
+    """所有钩子函数统一的返回结果类型"""
+    action: str = "continue"                    # "continue" | "block" | "force_continue"
+    message: str | None = None                  # 附带消息
+
+
 # —— Hook System ────────────────────────────────────
 
 
@@ -128,68 +151,73 @@ def register_hook(event: str, callback):
     HOOKS[event].append(callback)
 
 
-def trigger_hooks(event: str, *args):
+def trigger_hooks(event: str, ctx: HookContent) -> HookResult:
+    final = HookResult()
     for callback in HOOKS[event]:
-        result = callback(*args)
-        if result is not None:
+        result = callback(ctx)
+        if result is None:
+            continue
+        if result.action == "block":
             return result
-    return None
+        elif result.action == "force_continue":
+            final = result
+    return final
 
 
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
 DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
 
-def permission_hook(block):
+def permission_hook(ctx: HookContent) -> HookResult:
     """PreToolUse: s03 check_permission() logic moved here."""
-    if block.name == "bash":
+    if ctx.tool_name == "bash":
         for pattern in DENY_LIST:
-            if pattern in block.input.get("command", ""):
+            if pattern in ctx.tool_input.get("command", ""):
                 print(f"\n\033[31m⛔ Blocked: '{pattern}'\033[0m")
-                return "Permission denied by deny list"
+                return HookResult(action="block", message="Permission denied by deny list")
         for kw in DESTRUCTIVE:
-            if kw in block.input.get("command", ""):
+            if kw in ctx.tool_input.get("command", ""):
                 print(f"\n\033[33m⚠  Potentially destructive command\033[0m")
-                print(f"   Tool: {block.name}({block.input})")
+                print(f"   Tool: {ctx.tool_name}({ctx.tool_input})")
                 choice = input("   Allow? [y/N] ").strip().lower()
                 if choice not in ("y", "yes"):
-                    return "Permission denied by user"
-    if block.name in ("write_file", "edit_file"):
-        path = block.input.get("path", "")
+                    return HookResult(action="block", message="Permission denied by user")
+    if ctx.tool_name in ("write_file", "edit_file"):
+        path = ctx.tool_input.get("path", "")
         if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
             print(f"\n\033[33m⚠  Writing outside workspace\033[0m")
-            print(f"   Tool: {block.name}({block.input})")
+            print(f"   Tool: {ctx.tool_name}({ctx.tool_input})")
             choice = input("   Allow? [y/N] ").strip().lower()
             if choice not in ("y", "yes"):
-                return "Permission denied by user"
+                return HookResult(action="block", message="Permission denied by user")
     return None
 
 
-def log_hook(block):
+def log_hook(ctx: HookContent) -> HookResult:
     """PreToolUse: log every tool call."""
-    args_preview = str(list(block.input.values())[:2])[:60]
-    print(f"\033[90m[HOOK] {block.name}({args_preview})\033[0m")
+    args_preview = str(list(ctx.tool_input.values())[:2])[:60]
+    print(f"\033[90m[HOOK] {ctx.tool_name}({args_preview})\033[0m")
     return None
 
 
-def large_output_hook(block, output):
+def large_output_hook(ctx: HookContent) -> HookResult:
     """PostToolUse: warn on large output."""
-    if len(str(output)) > 100000:
-        print(f"\033[33m[HOOK] ⚠ Large output from {block.name}: {len(str(output))} chars\033[0m")
+    if ctx.tool_output and len(str(ctx.tool_output)) > 100000:
+        print(f"\033[33m[HOOK] ⚠ Large output from {ctx.tool_name}: {len(str(ctx.tool_output))} chars\033[0m")
     return None
 
 
-def context_inject_hook(query: str):
+def context_inject_hook(ctx: HookContent) -> HookResult:
     """UserPromptSubmit: inject context"""
     print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
     return None
 
 
-def summary_hook(messages: list):
+def summary_hook(ctx: HookContent) -> HookResult:
     """Stop: count tool calls"""
     tool_count = sum(
         1 
-        for m in messages
+        for m in ctx.message
         for b in (m.get("content") if isinstance(m.get("content"), list) else [])
         if isinstance(b, dict) and b.get("type") == "tool_result"
     )
@@ -217,9 +245,13 @@ def agent_loop(messages: list):
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason != "tool_use":
-            force = trigger_hooks("Stop", messages)
-            if force:
-                messages.append({"role": "user", "content": force})
+            # Stop: 需要退出 loop 时（即触发 Stop 钩子，这里指的是工具调用结束时）需要执行的操作
+            force = trigger_hooks("Stop", HookContent(
+                hook_event_name="Stop", 
+                message=messages
+            ))
+            if force.action == "force_continue":
+                messages.append({"role": "user", "content": force.message or "continue"})
                 continue
             return
 
@@ -227,20 +259,31 @@ def agent_loop(messages: list):
         for block in response.content:
             if block.type != "tool_use":
                 continue
-
-            blocked = trigger_hooks("PreToolUse", block)
-            if blocked:
+            
+            # PreToolUse: 工具调用前需要执行的一些操作
+            res = trigger_hooks("PreToolUse", HookContent(
+                hook_event_name="PreToolUse", 
+                tool_name=block.name, 
+                tool_input=block.input
+            ))
+            if res.action == "block":
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": str(blocked),
+                    "content": res.message or "Blocked by hook",
+                    "is_error": True,
                 })
                 continue
 
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else f"Unknown: {block.name}"
             
-            trigger_hooks("PostToolUse", block, output)
+            # PostToolUse: 工具调用后需要执行的一些操作
+            trigger_hooks("PostToolUse", HookContent(
+                hook_event_name="PostToolUse", 
+                tool_name=block.name, 
+                tool_output=output
+            ))
             results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -257,14 +300,19 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms01 >> \033[0m")
+            query = input("\033[36ms04 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
 
         if query.strip().lower() in ("q", "exit", ""):
             break
         
-        trigger_hooks("UserPromptSubmit", query)
+        # UserPromptSubmit: 用户输入 promt 后需要执行的一些操作
+        trigger_hooks("UserPromptSubmit", HookContent(
+            hook_event_name="UserPromptSubmit", 
+            user_query=query
+        ))
+
         history.append({"role": "user", "content": query})
         agent_loop(history)
         

@@ -7,6 +7,25 @@ from dataclasses import dataclass
 from typing import Any
 
 
+"""
+Q & A
+
+Q: 怎么保证每个 sub_agent 拿到的都是干净上下文？
+A: 如果触发了 task 工具, 比如说 content 中的 ToolUseBlock 可能长这样:
+
+    ToolUseBlock(
+        id='call_00_7Bd9bRzSMpIbKOyi0TzX9237', 
+        caller=None, 
+        input={'description': '帮我把所有 .py 文件里的 import 规范化'}, 
+        name='task', 
+        type='tool_use'
+    )
+
+   代码就会把子任务的描述(description)传入 spawn_subagent,
+   然后被封装到子 agent 中的 messages 中（此时子 agent 的 messages 列表中就只有这一条信息）
+"""
+
+
 # ── Settings ────────────────────────────
 
 
@@ -158,7 +177,7 @@ def spawn_subagent(description: str) -> str:
             model=MODEL,
             system=SUB_SYSTEM,
             messages=messages,
-            tools=TOOLS,
+            tools=SUB_TOOLS,
             max_tokens=8000,
         )
         messages.append({'role': 'assistant', 'content': response.content})
